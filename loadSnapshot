@@ -1,0 +1,198 @@
+#!/bin/bash
+
+#exit whenever a command exits with no 0 (no exceptions)
+set -e
+
+#undefined variables = error
+set -u
+
+#pipe is successfull if all the commands in a pipeline are executed successfully
+set -o pipefail
+
+
+#############################
+# CONFIGURATION
+#############################
+
+#### IMPORTANT: the snapshot folder should contain only the dirs    #######
+#### of the keyspaces (delete any loose file in the root eg *.log)  #######
+
+
+#Cassandra Home:
+IP="10.138.0.23"
+CHOME="./apache-cassandra-3.11.3"
+
+
+
+function usage() {
+	printf "\n\n"
+	printf "   This script will load a snapshot (taken with getSnapshot) into an empty cassandra node\n\n\n"
+    printf "   Usage: \n\n"
+    printf "     	-h to show this help \n"
+    printf "     	-f to specify snapshot folder \n"
+    printf "     	-k to specify a keyspace (omitt to import all)\n"
+    printf "     	-s to specify keyspaces that you don't want to restore (use comma to concatenate multiple keyspaces) \n" 
+	printf "     	-c do not create schema \n"  
+    printf "     	-m do not move files \n\n"  
+    printf "   \n"
+    printf "   Example - upload ONLY keyspace plugg from snapshot saved in -f directory:\n\n"
+    printf "          ./loadSnapshot -f ./snapshot-2019-06-05 -k plugg\n\n"  
+    exit 0
+}
+
+
+
+
+#########################################################
+#GLOBAL VARIABLES
+#########################################################
+SNAPSHOT_FOLDER=""
+KEYSPACE=""
+#since we are using set -u this is the easiest way I've found to init SKIPKEYSPACES and avoid unbound variable when no -s is specified
+SKIPKEYSPACES=("-33dummy33-")
+createSchema=true
+moveFiles=true
+
+
+#########################################################
+# init params from command line
+#########################################################
+
+
+while getopts 'f:k:hstcm' OPTION; do
+  case "$OPTION" in
+  	f)
+		SNAPSHOT_FOLDER="$OPTARG"
+		;;
+  	k) 
+		KEYSPACE="$OPTARG"
+		;;
+	h) usage 
+	   ;;
+	s) 
+		SKIPKEYSPACES=()
+		SKIPKEYSPACES=(${OPTARG//,/ })
+		;;
+	t)
+		#skip all
+		createSchema=false
+		moveFiles=false
+		;;
+	c) 	
+		createSchema=false
+		;;
+	m) 
+		moveFiles=false
+		;;
+		
+  esac
+done
+shift "$(($OPTIND -1))"
+
+
+if [ "$SNAPSHOT_FOLDER" == "" ]; then
+	echo "Please specify snapshot folder (-f option)"
+	exit 1
+fi
+
+ALL_KEYSPACES=()
+
+if [ "$KEYSPACE" == "" ]; then
+	for entry in "$SNAPSHOT_FOLDER"/*
+	do
+	  	
+	  	fName=`basename "$entry"`
+	  	#get rid of the UUID
+	    pureName=${fName%-*}
+
+	  	add=true
+
+	  	for s in "${SKIPKEYSPACES[@]}" ; do
+			if [ "$pureName" == "$s" ]; then
+	  			add=false	
+	  		fi
+	  	done
+
+	  	if $add ; then
+			ALL_KEYSPACES+=($entry)
+		fi
+	done
+else 
+	ALL_KEYSPACES=("$SNAPSHOT_FOLDER$KEYSPACE")
+fi
+
+
+for ksFolder in "${ALL_KEYSPACES[@]}"; do
+	keyspace=`basename "$ksFolder"`
+done
+
+
+touch ./loadSnapshot.log 	
+
+for ksFolder in "${ALL_KEYSPACES[@]}"; do
+	
+	keyspace=`basename "$ksFolder"`
+
+	### RECREATE SCHEMA
+	echo "Working on: $keyspace"
+
+	printf "Importing schema...\n"
+	if $createSchema ; then
+		$CHOME/bin/cqlsh -f $ksFolder/schema.cql $IP > ./loadSnapshot.log 	
+	else
+		printf "Not running: $ksFolder/schema.cql\n"
+	fi	
+	printf " done"
+	printf "\n"
+
+
+	destination="$CHOME/data/data/$keyspace"
+
+
+	#get the table folders 
+	allTableFolders=()
+	for dFolder in "$destination"/*
+	do
+	    fName=`basename "$dFolder"`
+	    allTableFolders+=($fName)
+	done
+
+
+	for table in "$ksFolder/snapshots"/*
+	do
+	        tableName=`basename "$table"`
+
+	        #get rid of the UUID
+	        pureName=${tableName%-*}
+
+	        for targetFolder in "${allTableFolders[@]}";
+	        do
+	        		#get rid of the UUID
+	                tfPureName=${targetFolder%-*}
+
+	                if [ "$pureName" == "$tfPureName" ]; then
+
+	                        moveTo="$destination/$targetFolder"
+                        	
+                        	if $moveFiles ; then
+                        		cp $table/* $moveTo 2>/dev/null || :
+							else
+								printf "NOT MOVING: $table/*"
+								printf "TO: $moveTo"
+								printf "---------------------------"
+							fi	
+
+	                        
+	                fi
+	        done
+
+	done
+
+done
+
+
+echo "RESTART CASSANDRA!!!!"
+
+
+
+

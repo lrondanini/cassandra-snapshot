@@ -1,0 +1,260 @@
+#!/bin/bash
+
+#exit whenever a command exits with no 0 (no exceptions)
+set -e
+
+#undefined variables = error
+set -u
+
+#pipe is successfull if all the commands in a pipeline are executed successfully
+set -o pipefail
+
+#############################
+# CONFIGURATION
+#############################
+
+
+
+#Cassandra Home:
+IP="10.138.0.23"
+CHOME="./apache-cassandra-3.11.3"
+
+#where to store the new snapshot
+BASEDIR="./cassandra_snapshot"
+
+#where to move previous snapshots (if any)
+PREVSNAPSHOTSDIR="./previous_snapshot"
+
+#cql 3
+C_VERSION="3"
+
+
+#########################################################
+#GLOBAL VARIABLES
+#########################################################
+KEYSPACE=""
+declare -a ALLKEYSPACES
+#since we are using set -u this is the easiest way I've found to init SKIPKEYSPACES and avoid unbound variable when no -s is specified
+SKIPKEYSPACES=("-33dummy33-")
+TIMESTAMP=$( date +"%Y-%m-%d" )
+SNAPSHOT_NAME=$TIMESTAMP
+TMPDIR="$BASEDIR/snapshot-$TIMESTAMP"
+LOG_FILE="$TMPDIR/$TIMESTAMP.log"
+
+#to restart the same backprocess without having to deal with a snapshot folder that has already been created
+isResuming=false
+
+#########################################################
+#FUNCTIONS
+#########################################################
+
+function usage() {
+    printf "\n Usage: plGetSnapshot \n"
+    printf "   -h to show this help \n"
+    printf "   -k to specify a keyspace \n\n"
+    printf "   -s to specify keyspaces that you don't want to backup (use comma to concatenate multiple keyspaces) \n\n"    
+    exit 0
+}
+
+function LoadKeyspaces() {
+	ALLKEYSPACES=()
+
+	echo "Loading keyspaces..."
+
+	TMPKEYSPACES=(`$CHOME"/bin/cqlsh" $IP -e "describe keyspaces;"`)
+	for i in "${TMPKEYSPACES[@]}" ; do
+	  if [ "$i" != "system_auth" -a "$i" != "system" -a "$i" != "deleteme" -a "$i" != "system_distributed" -a "$i" != "system_traces" -a "$i" != "system_schema" ]; then
+	  	add=true
+
+	  	for s in "${SKIPKEYSPACES[@]}" ; do
+			if [ "$i" == "$s" ]; then
+	  			add=false	
+	  		fi
+	  	done
+
+	  	if $add ; then
+			ALLKEYSPACES+=($i)	
+		fi
+
+	  fi	
+	done	
+}
+
+
+
+#########################################################
+# init params from command line
+#########################################################
+
+
+while getopts 'k:hs:r' OPTION; do
+  case "$OPTION" in
+  	k) 
+		KEYSPACE="$OPTARG"
+		;;
+	h) usage 
+	   ;;
+	s) 
+		SKIPKEYSPACES=()
+		SKIPKEYSPACES=(${OPTARG//,/ })
+		;;
+	r)
+		#resume
+		isResuming=true
+		;;
+  esac
+done
+shift "$(($OPTIND -1))"
+
+
+
+#########################################################
+# Create temporary working directory
+#########################################################
+
+if [ -d "$TMPDIR" ]; then
+    # already exists
+
+    if $isResuming ; then
+		echo "Resuming backup in $TMPDIR"
+	else
+		echo "Cannot create temporary directory $TMPDIR to work! Also remove $TMPDIR.tar.gz if present!"   
+    	exit 1;
+	fi
+    
+else
+    # does not exists:
+    #move previous snapshots
+    rm -fr $PREVSNAPSHOTSDIR/*
+    mv $BASEDIR/* $PREVSNAPSHOTSDIR/
+    mkdir "$TMPDIR"
+fi
+
+#########################################################
+# Create log file
+#########################################################
+
+touch $LOG_FILE
+
+#########################################################
+# GET KEYSPACE(S) NAMES TO BACKUP
+#########################################################
+
+if [ "$KEYSPACE" == "" ]; then
+	LoadKeyspaces
+else 
+	ALLKEYSPACES=($KEYSPACE)
+fi
+
+#print, just as a courtesy measure
+echo "Backing up keyspaces:"
+
+for i in "${ALLKEYSPACES[@]}" ; do
+	echo " $i"
+done
+
+#########################################################
+# CLEAR ALL OLD SNAPSHOTS
+#########################################################
+
+$CHOME/bin/nodetool clearsnapshot 
+
+#########################################################
+# SAVE EVERY KEYSPACE TABLES SCHEMAS
+#########################################################
+
+for i in "${ALLKEYSPACES[@]}"; do
+	keyspace=$i
+    
+	baseDirectory="$TMPDIR/$keyspace"
+	savingDirectory="$baseDirectory/snapshots"
+
+	echo "Working on: $keyspace"
+	mkdir "$baseDirectory"
+	mkdir "$savingDirectory"
+
+	
+  	
+	printf "Exporting schema..."
+	`$CHOME"/bin/cqlsh" $IP -e "describe $keyspace;" > $baseDirectory/schema.cql`
+	printf " done"
+	printf "\n"
+
+	printf "Creating snapshot: \n"
+	# 2>/dev/null is added to avoid messages
+	$CHOME/bin/nodetool snapshot $keyspace -t $SNAPSHOT_NAME > $LOG_FILE
+	
+	echo "Loading tables name..."
+
+	#Fetch all directories (tables) in the keyspace
+	ALLDIRS=()
+	DIRS="$CHOME/data/data/$keyspace/*"
+	for file in $DIRS; do 
+		fileName=`basename $file`
+		ALLDIRS+=($fileName)
+	done
+
+	#get all tables from cassandra	
+	#IN DEVELOPMENT: SELECT columnfamily_name FROM system.schema_columnfamilies WHERE keyspace_name='$keyspace';
+	#IN PRODUCTION: SELECT table_name FROM system_schema.tables WHERE keyspace_name = '$keyspace';
+	if [ "$C_VERSION" == "3" ];then
+		ALLTABLES=(`$CHOME"/bin/cqlsh" $IP -e "paging off;SELECT table_name FROM system_schema.tables WHERE keyspace_name='$keyspace';"`)
+	else 
+		ALLTABLES=(`$CHOME"/bin/cqlsh" $IP -e "paging off;SELECT columnfamily_name FROM system.schema_columnfamilies WHERE keyspace_name='$keyspace';"`)
+	fi
+
+	len=${#ALLTABLES[@]}
+	#last 2 lines are for '(123 rows)' - they are split per space
+	lastItem=`expr $len - 2`
+
+	echo "Coping snapshot files: "
+
+	for (( i=0; i<$len; i++ )); do
+
+		# first 2 lines are headers
+		if (( $i > 1 && $i < $lastItem )); then
+			TABLE=${ALLTABLES[$i]}
+			tableDir="$TABLE-"
+			
+			#create folder before coping:
+			mkdir "$savingDirectory/$TABLE"
+
+			#for each table find corresponding directory:
+			for d in "${ALLDIRS[@]}"; do 
+				#directory with name starting with $tableDir (note the dash/- at the end!!!!)
+				if [[ "$d" == "$tableDir"* ]]; then
+					#copy all files
+					# 2>/dev/null is added to avoid error messages (we skip directories)
+					# || : is added to avoid exit code = 1 (error) that would stop the script (see top of this script set -e)
+					cp $CHOME/data/data/$keyspace/$d/* $savingDirectory/$TABLE 2>/dev/null || :
+
+					echo "		$TABLE"						  
+				fi
+			done
+		fi
+
+	done
+
+	echo "DONE - Coping snapshot files"
+	echo ""
+
+	printf "Clean snapshot files "	
+	# 2>/dev/null is added to avoid messages
+	$CHOME/bin/nodetool clearsnapshot $keyspace -t $SNAPSHOT_NAME 2>/dev/null
+	printf " done"
+	printf "\n"
+done
+
+
+printf "Zipping directory"
+tar -zcvf $SNAPSHOT_NAME.tar.gz $TMPDIR 2>/dev/null
+mv $SNAPSHOT_NAME.tar.gz $BASEDIR
+printf " done"
+printf "\n"
+
+echo "ALL DONE! YOU ARE WELCOME!"
+
+printf "\n"
+
+
+
